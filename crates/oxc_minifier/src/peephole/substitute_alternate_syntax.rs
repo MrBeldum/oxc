@@ -1883,13 +1883,13 @@ impl<'a> PeepholeOptimizations {
 
         let is_empty_iife = match &call_expr.callee {
             Expression::FunctionExpression(f) => {
-                f.params.is_empty()
+                !f.params.has_parameter()
                     && f.body.as_ref().is_some_and(|body| body.is_empty())
                     // ignore async/generator if a return value is not used
                     && ((!f.r#async && !f.generator) || Self::is_expression_result_unused(ctx))
             }
             Expression::ArrowFunctionExpression(f) => {
-                f.params.is_empty()
+                !f.params.has_parameter()
                     && f.body.is_empty()
                     // ignore async if a return value is not used
                     && (!f.r#async || Self::is_expression_result_unused(ctx))
