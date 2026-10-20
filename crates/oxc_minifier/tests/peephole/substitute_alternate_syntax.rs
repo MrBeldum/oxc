@@ -1188,4 +1188,6 @@ fn empty_iife_preserves_rest_destructuring() {
     test_same("((...[[v]]) => {})();");
     test("(function (...args) {})();", "");
     test("((...args) => {})();", "");
+    test("x = (function (...args) {})();", "x = void 0;");
+    test("x = ((...args) => {})();", "x = void 0;");
 }
