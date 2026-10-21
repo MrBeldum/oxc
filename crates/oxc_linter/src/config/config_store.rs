@@ -77,6 +77,34 @@ pub struct Config {
     pub(crate) overrides: ResolvedOxlintOverrides,
 }
 
+/// Computes a linted file's path relative to its config directory, which is
+/// what `overrides` globs are matched against.
+///
+/// The config path and the linted path may reach the same directory through
+/// different symlink routes: an absolute `-c` path is used as given, while
+/// relative lint targets are resolved against the (physical) working
+/// directory. A literal `strip_prefix` then fails, the file is treated as
+/// lying outside the config directory, and all directory-anchored override
+/// globs silently stop matching
+/// (<https://github.com/oxc-project/oxc/issues/28001>).
+///
+/// The literal comparison is kept as a fast path; `canonicalize` is only
+/// attempted when it fails, and any canonicalization failure falls back to
+/// the original path, preserving the previous behavior for paths that do
+/// not exist on disk.
+fn strip_config_prefix(path: &Path, config_dir: &Path) -> PathBuf {
+    if let Ok(stripped) = path.strip_prefix(config_dir) {
+        return stripped.to_path_buf();
+    }
+    let (Ok(canonical_path), Ok(canonical_dir)) = (path.canonicalize(), config_dir.canonicalize())
+    else {
+        return path.to_path_buf();
+    };
+    canonical_path
+        .strip_prefix(&canonical_dir)
+        .map_or_else(|_| path.to_path_buf(), Path::to_path_buf)
+}
+
 impl Config {
     fn builtin_rule_plugins(plugins: LintPlugins) -> LintPlugins {
         plugins
@@ -134,9 +162,9 @@ impl Config {
             .path
             .as_ref()
             .and_then(|config_path| {
-                config_path.parent().map(|parent| path.strip_prefix(parent).unwrap_or(path))
+                config_path.parent().map(|parent| strip_config_prefix(path, parent))
             })
-            .unwrap_or(path);
+            .unwrap_or_else(|| path.to_path_buf());
 
         let path = relative_path.to_string_lossy();
         let path = path.as_ref();
@@ -1639,6 +1667,69 @@ mod test {
         assert!(
             no_unused_vars.is_none(),
             "no-unused-vars should not be re-enabled when correctness is off"
+        );
+    }
+
+    /// <https://github.com/oxc-project/oxc/issues/28001>
+    ///
+    /// Overrides with directory-anchored globs (e.g. `src/**/*.js`) must apply when the
+    /// config path reaches the config directory through a symlink while the linted file
+    /// path does not (on macOS `/tmp` is a symlink to `/private/tmp`). Both sides must
+    /// be canonicalized before computing the relative path, otherwise the file looks
+    /// like it sits outside the config directory and the glob silently never matches.
+    #[cfg(unix)]
+    #[test]
+    fn test_overrides_apply_when_config_path_goes_through_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let real_dir = std::env::temp_dir().join(format!("oxc-28001-real-{}", std::process::id()));
+        let link_dir = std::env::temp_dir().join(format!("oxc-28001-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&real_dir);
+        let _ = std::fs::remove_file(&link_dir);
+        std::fs::create_dir_all(real_dir.join("src")).unwrap();
+        // `canonicalize` requires the path to exist; in real usage the linted
+        // file always exists because the walker discovered it on disk.
+        std::fs::write(real_dir.join("src").join("a.js"), "debugger;\n").unwrap();
+        symlink(&real_dir, &link_dir).unwrap();
+
+        struct Guard(PathBuf, PathBuf);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+                let _ = std::fs::remove_file(&self.1);
+            }
+        }
+        let _guard = Guard(real_dir.clone(), link_dir.clone());
+
+        // Config path goes through the symlink route; the linted file takes the
+        // physical route.
+        let mut oxlintrc = serde_json::from_str::<Oxlintrc>(
+            r#"{
+                "categories": { "correctness": "off" },
+                "overrides": [{ "files": ["src/**/*.js"], "rules": { "no-debugger": "error" } }]
+            }"#,
+        )
+        .unwrap();
+        oxlintrc.path = link_dir.join(".oxlintrc.json");
+
+        let mut external_plugin_store = ExternalPluginStore::default();
+        let config = ConfigStoreBuilder::from_oxlintrc(
+            false,
+            oxlintrc,
+            None,
+            &mut external_plugin_store,
+            None,
+        )
+        .unwrap()
+        .build(&mut external_plugin_store)
+        .unwrap();
+
+        let file_path = real_dir.join("src").join("a.js");
+        let resolved = config.apply_overrides(&file_path);
+        let no_debugger = resolved.rules.iter().find(|(rule, _)| rule.name() == "no-debugger");
+        assert!(
+            no_debugger.is_some(),
+            "no-debugger override with anchored glob should apply when the config path goes through a symlink"
         );
     }
 }

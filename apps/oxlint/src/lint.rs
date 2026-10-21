@@ -1357,6 +1357,40 @@ mod test {
         Tester::new().test_and_snapshot(args);
     }
 
+    #[cfg(unix)]
+    #[test]
+    // https://github.com/oxc-project/oxc/issues/28001
+    fn test_overrides_config_path_through_symlink() {
+        use std::os::unix::fs::symlink;
+
+        use crate::cli::CliRunResult;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let real_dir = temp_dir.path().join("real");
+        let link = temp_dir.path().join("link");
+        fs::create_dir_all(real_dir.join("src")).unwrap();
+        fs::write(real_dir.join("src").join("a.js"), "debugger;\n").unwrap();
+        fs::write(
+            real_dir.join(".oxlintrc.json"),
+            r#"{
+  "categories": { "correctness": "off" },
+  "overrides": [{ "files": ["src/**/*.js"], "rules": { "no-debugger": "error" } }]
+}"#,
+        )
+        .unwrap();
+        symlink("real", &link).unwrap();
+
+        // The test cwd is the physical directory (as `env::current_dir()`
+        // returns when the shell reached it through the symlink), while `-c`
+        // points at the config through the symlink route. The anchored
+        // override glob must still apply.
+        let config_arg = link.join(".oxlintrc.json").to_string_lossy().into_owned();
+        let (stdout, result) =
+            Tester::new().with_cwd(real_dir).test_output(&["-c", &config_arg, "src/a.js"]);
+        assert!(matches!(result, CliRunResult::LintFoundErrors), "{result:?}\n{stdout}");
+        assert!(stdout.contains("on 1 file"), "{stdout}");
+    }
+
     #[test]
     fn test_overrides_envs_and_global() {
         let args = &["-c", ".oxlintrc.json", "."];
