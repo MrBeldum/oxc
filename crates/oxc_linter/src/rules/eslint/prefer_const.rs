@@ -151,6 +151,18 @@ impl Rule for PreferConst {
             }
         }
 
+        // The fixer may only rewrite `let` to `const` when EVERY declarator in the
+        // declaration can be `const`. ESLint reports each const-eligible variable
+        // but leaves the declaration unchanged when any sibling declarator is
+        // reassigned (<https://github.com/oxc-project/oxc/issues/28003>).
+        let all_declarators_const = decl.declarations.iter().all(|declarator| {
+            let has_init = declarator.init.is_some();
+            declarator.id.get_binding_identifiers().iter().all(|ident| {
+                let symbol_id = ident.symbol_id();
+                self.should_be_const(symbol_id, has_init, is_for_in_of_init, ctx)
+            })
+        });
+
         for (declarator_index, declarator) in decl.declarations.iter().enumerate() {
             let binding_identifiers = declarator.id.get_binding_identifiers();
             let has_init = declarator.init.is_some();
@@ -160,7 +172,6 @@ impl Rule for PreferConst {
                 let symbol_id = ident.symbol_id();
                 self.should_be_const(symbol_id, has_init, is_for_in_of_init, ctx)
             });
-
             // For destructuring patterns with "all" mode, check if ALL variables should be const
             if matches!(self.0.destructuring, Destructuring::All) && is_destructuring {
                 if all_const {
@@ -173,7 +184,7 @@ impl Rule for PreferConst {
                                     fixer,
                                     decl,
                                     declarator_index,
-                                    true,
+                                    all_declarators_const,
                                     is_for_in_of_init,
                                     ctx,
                                 )
@@ -193,7 +204,7 @@ impl Rule for PreferConst {
                                     fixer,
                                     decl,
                                     declarator_index,
-                                    all_const,
+                                    all_declarators_const,
                                     is_for_in_of_init,
                                     ctx,
                                 )
@@ -1133,6 +1144,37 @@ fn test() {
         ("const x = [1,2]; let [,y] = x;", "const x = [1,2]; const [,y] = x;", None),
         ("const x = [1,2,3]; let [y,,z] = x;", "const x = [1,2,3]; const [y,,z] = x;", None),
         ("let x = 'x', y = 'y';", "const x = 'x', y = 'y';", None),
+        (
+            // Regression test for <https://github.com/oxc-project/oxc/issues/28003>:
+            // the fixer must not rewrite a multi-declarator `let` to `const`
+            // when another declarator is reassigned. ESLint reports `b`
+            // but leaves the declaration unchanged.
+            "let a = 1, b = 2; a++; console.log(a + b);",
+            "let a = 1, b = 2; a++; console.log(a + b);",
+            None,
+        ),
+        (
+            // Same bug with the reassigned declarator last: the fixer must not
+            // const-ify the whole declaration because of a const-eligible one.
+            "let a = 1, b = 2; b++; console.log(a + b);",
+            "let a = 1, b = 2; b++; console.log(a + b);",
+            None,
+        ),
+        (
+            // Multi-declarator with `destructuring: "all"`: a reassigned sibling
+            // declarator must also suppress the fix (destructuring declarator is
+            // last, so the old unconditional `true` would have applied it).
+            "let b = 1, { a } = obj; b++; foo(a, b);",
+            "let b = 1, { a } = obj; b++; foo(a, b);",
+            Some(serde_json::json!([{ "destructuring": "all" }])),
+        ),
+        (
+            // Positive control: when every declarator is const-eligible, the
+            // fixer still rewrites the whole declaration.
+            "let a = 1, b = 2; console.log(a + b);",
+            "const a = 1, b = 2; console.log(a + b);",
+            None,
+        ),
         ("let x = 1, y = 'y'; let z = 1;", "const x = 1, y = 'y'; const z = 1;", None),
         (
             "let { a, b, c} = obj; let { x, y, z} = anotherObj; x = 2;",
